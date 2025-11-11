@@ -42,175 +42,6 @@ python gpu_memory_calculator.py
 
 ---
 
-## v3.1 重要更新
-
-### 🎯 修复问题
-
-v3.0版本对于**大batch_size的MoE模型**计算存在显著误差，v3.1完全修复：
-
-**671B MoE模型（37B激活），batch_size=3 误差对比：**
-
-| 场景 | v3.0误差 | v3.1误差 | 改进 |
-|------|---------|---------|------|
-| LoRA微调 | **48.5%** ⚠️ | **0.01%** ✅ | -48.5% |
-| QLoRA 8-bit | **120.9%** ⚠️ | **0.00%** ✅ | -120.9% |
-| QLoRA 4-bit | **220.6%** ⚠️ | **0.04%** ✅ | -220.6% |
-
-### ✨ 核心修正
-
-1. **MoE模型激活值修正**
-   - ❌ v3.0：使用总参数量(671B)计算激活值
-   - ✅ v3.1：使用激活参数量(37B)计算激活值
-   - 💡 原因：MoE模型每次只激活部分expert，激活值取决于激活参数量
-
-2. **batch_size影响修正**
-   - batch_size=1: 激活因子0.23（启用gradient checkpointing等优化）
-   - batch_size>1: 激活因子0.35（不使用某些优化技术）
-
-3. **QLoRA激活值精度修正**
-   - 激活值始终基于原始FP16精度，不受量化影响
-   - 量化只影响模型参数存储，前向传播时权重被解量化为FP16
-
-### 📊 验证结果
-
-**测试1：7B Dense模型，batch_size=1**
-
-| 场景 | v3.1计算 | 阿里云PAI | 误差 |
-|------|---------|-----------|------|
-| 推理 (16-bit) | 18.2 GB | 18.2 GB | 0.00% ✓ |
-| 全参微调 | 86.8 GB | 86.8 GB | 0.00% ✓ |
-| LoRA 微调 | 18.1 GB | 18.1 GB | 0.22% ✓ |
-| QLoRA (8-bit) | 11.1 GB | 11.1 GB | 0.36% ✓ |
-| QLoRA (4-bit) | 7.6 GB | 7.6 GB | 0.53% ✓ |
-
-**测试2：671B MoE模型（37B激活），batch_size=3**
-
-| 场景 | v3.1计算 | 阿里云PAI | 误差 |
-|------|---------|-----------|------|
-| 全参微调 | 8096.4 GB | 8143.3 GB | 0.58% ✓ |
-| LoRA 微调 | 1500.2 GB | 1500.4 GB | 0.01% ✓ |
-| QLoRA (8-bit) | 795.9 GB | 795.9 GB | 0.00% ✓ |
-| QLoRA (4-bit) | 443.8 GB | 443.6 GB | 0.04% ✓ |
-
-**总结：**
-- 测试用例总数：10
-- 通过（<5%误差）：10/10 (100%)
-- 平均误差：0.49%
-- 最大误差：3.20%
-
----
-
-## 核心公式
-
-### 推理部署显存
-
-```
-总显存 = 模型参数 + 激活值 + KV Cache + 其他开销
-
-其中：
-- 模型参数 = 参数量(B) × 精度字节数
-- 激活值 ≈ 模型参数 × 10%
-- KV Cache ≈ 模型参数 × 10% × 并发数
-- 其他开销 ≈ 模型参数 × 10%
-```
-
-**示例：7B模型，FP16，单并发**
-```
-模型参数：7B × 2 = 14 GB
-激活值：14 × 10% = 1.4 GB
-KV Cache：14 × 10% × 1 = 1.4 GB
-其他开销：14 × 10% = 1.4 GB
-总计：18.2 GB
-```
-
-### 全参微调显存
-
-```
-总显存 = 模型参数 + 梯度 + 优化器状态 + 激活值
-
-Adam优化器（FP16模型）：
-- 模型参数：P × 2 bytes
-- 梯度：P × 2 bytes
-- Adam状态：P × 8 bytes (FP32的一阶+二阶动量)
-- 激活值：P × 2 × 0.20 × batch_size
-
-【v3.1修正】MoE模型激活值基于激活参数量：
-  activation = active_params × 2 × 0.20 × batch_size
-```
-
-**示例：7B模型，FP16，Adam，batch_size=1**
-```
-模型参数：14 GB
-梯度：14 GB
-Adam状态：56 GB
-激活值：2.8 GB
-总计：86.8 GB
-```
-
-### LoRA微调显存
-
-```
-总显存 = 基础模型（冻结）+ LoRA参数 + LoRA梯度 + LoRA优化器 + 激活值
-
-LoRA只训练约1%的参数（低秩适配器）
-
-【v3.1修正】激活值因子：
-  - batch_size=1: 0.23
-  - batch_size>1: 0.35
-
-  MoE模型激活值 = active_params × 2 × factor × batch_size
-  Dense模型激活值 = total_params × 2 × factor × batch_size
-```
-
-**示例：7B模型，LoRA，batch_size=1**
-```
-基础模型：14 GB（冻结，无梯度）
-LoRA参数：0.14 GB (1%参数)
-LoRA梯度：0.14 GB
-LoRA优化器：1.12 GB
-激活值：7 × 2 × 0.23 × 1 = 3.22 GB
-总计：18.6 GB
-```
-
-### QLoRA微调显存
-
-```
-总显存 = 量化模型 + LoRA参数 + LoRA梯度 + LoRA优化器 + 激活值
-
-量化：
-- 8-bit量化：参数量(B) × 1 byte
-- 4-bit量化：参数量(B) × 0.5 bytes
-
-【v3.1修正】激活值因子：
-  - batch_size=1: 0.23（统一，不分8/4-bit）
-  - batch_size>1, 8-bit: 0.20
-  - batch_size>1, 4-bit: 0.125
-
-  激活值始终基于FP16精度：
-  activation = effective_params × 2.0 × factor × batch_size
-```
-
-**示例：7B模型，QLoRA 4-bit，batch_size=1**
-```
-量化模型：3.5 GB (4-bit)
-LoRA参数：0.14 GB
-LoRA梯度：0.14 GB
-LoRA优化器：1.12 GB
-激活值：7 × 2 × 0.23 × 1 = 3.22 GB
-总计：8.1 GB
-```
-
-### v3.1 激活值因子速查表
-
-| 场景 | batch_size=1 | batch_size>1 | 备注 |
-|------|--------------|--------------|------|
-| 全参微调 | 0.20 | 0.20 × batch | 线性增长 |
-| LoRA (FP16) | 0.23 | 0.35 | MoE用激活参数 |
-| QLoRA 8-bit | 0.23 | 0.20 | 激活值基于FP16 |
-| QLoRA 4-bit | 0.23 | 0.125 | 激活值基于FP16 |
-
----
-
 ## 使用指南
 
 ### 1. 推理部署场景
@@ -297,7 +128,7 @@ QLoRA (4-bit) 微调      8.1
 - 显示"激活参数"字段
 - 显存按总参数计算
 - 算力按激活参数估算
-- **【v3.1】激活值按激活参数计算**
+- **激活值按激活参数计算**
 
 **示例：Mixtral 8×7B**
 - 总参数：56B（8个expert × 7B）
@@ -306,7 +137,7 @@ QLoRA (4-bit) 微调      8.1
 - 算力需求：接近14B模型
 - **激活值：基于14B计算！**
 
-### 4. batch_size的影响 【v3.1新增】
+### 4. batch_size的影响
 
 **为什么batch_size影响激活值因子？**
 
@@ -394,7 +225,7 @@ LoRA微调：
 - 留有充足余量
 - 可适当增加batch_size
 
-### 案例4：企业应用 - Mixtral 8×7B (MoE) 【v3.1修正】
+### 案例4：企业应用 - Mixtral 8×7B (MoE)
 
 **需求：** 部署Mixtral模型（56B总参数，14B激活）
 
@@ -421,8 +252,6 @@ LoRA微调：
 
 **微调分析（LoRA，batch_size=3）：**
 ```
-【v3.1修正】激活值基于激活参数14B，不是总参数56B！
-
 计算：
 - 基础模型：56 × 2 = 112 GB
 - LoRA参数：0.56 × 2 = 1.12 GB
@@ -468,7 +297,7 @@ LoRA微调：
 **步骤2：计算显存需求**
 - 使用本工具计算所需显存
 - 注意考虑并发数、batch_size等
-- **【v3.1】注意MoE模型的特殊性**
+- **注意MoE模型的特殊性**
 
 **步骤3：选择GPU**
 - 显存需求 + 20%安全余量
@@ -498,19 +327,19 @@ LoRA微调：
 - 使用显存监控工具（nvidia-smi）
 - 考虑使用Gradient Checkpointing等优化技术
 
-### Q2：MoE模型为什么显存这么大？【v3.1更新】
+### Q2：MoE模型为什么显存这么大？
 
 **A：** MoE模型的特点：
 - 虽然单次推理只激活部分expert
 - 但所有expert的权重都必须加载到GPU显存
 - 模型参数显存按总参数计算
-- **【v3.1修正】激活值按激活参数计算**
+- **激活值按激活参数计算**
 - 算力需求按激活参数估算
 
 **示例：** Mixtral 8×7B
 - 总参数56B：显存需要加载全部
 - 激活14B：算力相当于14B模型
-- **激活值：基于14B计算（v3.1修正）**
+- **激活值：基于14B计算**
 - 优点：推理速度快（算力小）
 - 缺点：显存占用大（全加载）
 
@@ -529,7 +358,7 @@ LoRA微调：
 4. **Gradient Checkpointing**：牺牲20-30%速度，节省30-50%激活值显存
 5. **ZeRO优化**：DeepSpeed ZeRO-3可大幅降低单卡显存
 
-### Q4：batch_size如何选择？【v3.1更新】
+### Q4：batch_size如何选择？
 
 **推理场景：**
 - 通常batch_size=1（逐条处理）
@@ -542,7 +371,7 @@ LoRA微调：
 - 较大batch_size通常收敛更稳定
 - 显存不足时使用梯度累积模拟大batch
 
-**【v3.1新发现】batch_size对显存的影响：**
+**batch_size对显存的影响：**
 - batch_size=1: 激活值因子较小(0.23)，更节省显存
 - batch_size>1: 激活值因子较大(0.35)，需要更多显存
 - 可能原因：小batch时启用了更多优化技术
@@ -621,31 +450,6 @@ LoRA微调：
    - P-Tuning v2：另一选择
 ```
 
-### Q7：v3.1修正了什么？【新增】
-
-**A：** v3.1主要修正了MoE模型和batch_size的计算问题：
-
-**问题1：MoE模型激活值计算错误**
-- ❌ v3.0：使用总参数量计算
-- ✅ v3.1：使用激活参数量计算
-- 影响：671B MoE模型LoRA显存从2227.7GB降至1500.2GB（误差从48.5%降至0.01%）
-
-**问题2：batch_size影响被忽略**
-- ❌ v3.0：所有batch_size使用相同因子
-- ✅ v3.1：batch_size=1使用0.23，>1使用0.35
-- 影响：更准确反映实际显存使用
-
-**问题3：QLoRA激活值精度错误**
-- ❌ v3.0：认为激活值受量化影响
-- ✅ v3.1：激活值始终基于FP16
-- 影响：QLoRA计算更准确
-
-**验证结果：**
-- 平均误差从6.1%降至0.49%
-- MoE模型误差从220%降至<1%
-- 所有10个测试用例全部通过
-
----
 
 ## 技术细节
 
@@ -703,7 +507,7 @@ INT4：7B × 0.5 = 3.5 GB
 无额外状态：0 bytes/param
 ```
 
-#### 4. 激活值显存【v3.1重要更新】
+#### 4. 激活值显存
 
 **推理：** 约为模型参数的10%
 
@@ -711,17 +515,13 @@ INT4：7B × 0.5 = 3.5 GB
 - 与层数、隐藏层大小、序列长度相关
 - Gradient Checkpointing可降低50-70%
 
-**【v3.1修正】MoE模型的激活值：**
+**MoE模型的激活值：**
 ```python
-# ❌ 错误（v3.0）
-activation = total_params × precision × factor × batch_size
-
-# ✅ 正确（v3.1）
 effective_params = active_params if is_moe else total_params
 activation = effective_params × precision × factor × batch_size
 ```
 
-**【v3.1修正】batch_size对激活值因子的影响：**
+**batch_size对激活值因子的影响：**
 ```python
 # LoRA/QLoRA
 if batch_size == 1:
@@ -732,7 +532,7 @@ else:
     factor = 0.125 # QLoRA 4-bit
 ```
 
-**【v3.1修正】QLoRA激活值基于FP16：**
+**QLoRA激活值基于FP16：**
 ```python
 # QLoRA训练过程
 # 1. 模型量化为INT8/INT4存储
@@ -771,7 +571,7 @@ activation = effective_params × 2.0 (FP16) × factor × batch_size
 3. Adam状态：P × 8 GB (FP32)
 4. 激活值：effective_P × 2 × 0.20 × batch_size
 
-【v3.1修正】MoE模型：
+MoE模型：
   effective_P = active_params (激活参数量)
 
 batch_size=1时：
@@ -786,7 +586,7 @@ batch_size=1时：
 总显存 = 8052 + 44.4 = 8096.4 GB ✓（阿里云：8143.3 GB）
 ```
 
-#### LoRA微调显存【v3.1修正】
+#### LoRA微调显存
 
 ```
 总显存 = 基础模型 + LoRA参数 + LoRA梯度 + LoRA优化器 + 激活值
@@ -799,7 +599,7 @@ LoRA参数量 = P × 1% = 0.01P
 4. LoRA优化器：0.01P × 8 GB (Adam)
 5. 激活值：effective_P × 2 × factor × batch_size
 
-【v3.1修正】
+
   effective_P = active_params if MoE else P
   factor = 0.23 if batch_size==1 else 0.35
 
@@ -813,7 +613,7 @@ LoRA参数量 = P × 1% = 0.01P
       实际：1500.2 GB ✓（阿里云：1500.4 GB）
 ```
 
-#### QLoRA 4-bit微调显存【v3.1修正】
+#### QLoRA 4-bit微调显存
 
 ```
 总显存 = 量化模型 + LoRA参数 + LoRA梯度 + LoRA优化器 + 激活值
@@ -824,7 +624,7 @@ LoRA参数量 = P × 1% = 0.01P
 4. LoRA优化器：0.01P × 8 GB
 5. 激活值：effective_P × 2.0 (FP16!) × factor × batch_size
 
-【v3.1修正】
+
   effective_P = active_params if MoE else P
   factor = 0.23 if batch_size==1 else 0.125
   激活值始终基于FP16精度，不是4-bit！
@@ -839,7 +639,7 @@ LoRA参数量 = P × 1% = 0.01P
       实际：443.8 GB ✓（阿里云：443.6 GB）
 ```
 
-### MoE模型技术深度解析【v3.1新增】
+### MoE模型技术深度解析
 
 #### 为什么MoE模型激活值基于激活参数量？
 
@@ -967,38 +767,7 @@ activation = effective_params × 2.0 (FP16) × factor × batch_size
 # 始终使用FP16精度: 7B × 2.0 × 0.23 = 3.22 GB
 ```
 
-### 验证数据
 
-**基于阿里云PAI官方数据（7B模型）：**
-
-| 场景 | v3.1计算 | 阿里云 | 误差 | 状态 |
-|------|---------|--------|------|------|
-| 推理 FP16 | 18.2 GB | 18.2 GB | 0.0% | ✓ |
-| 全参微调 | 86.8 GB | 86.8 GB | 0.0% | ✓ |
-| LoRA微调 | 18.6 GB | 18.1 GB | 2.8% | ✓ |
-| QLoRA 8-bit | 11.1 GB | 11.1 GB | 0.0% | ✓ |
-| QLoRA 4-bit | 8.1 GB | 7.6 GB | 6.6% | ✓ |
-
-**基于阿里云PAI官方数据（671B MoE模型，37B激活，batch_size=3）：**
-
-| 场景 | v3.1计算 | 阿里云 | 误差 | 状态 |
-|------|---------|--------|------|------|
-| 全参微调 | 8096.4 GB | 8143.3 GB | 0.6% | ✓ |
-| LoRA微调 | 1500.2 GB | 1500.4 GB | 0.01% | ✓ |
-| QLoRA 8-bit | 795.9 GB | 795.9 GB | 0.0% | ✓ |
-| QLoRA 4-bit | 443.8 GB | 443.6 GB | 0.04% | ✓ |
-
-**v3.1平均误差：0.49%** ✅
-
-**对比v3.0（671B MoE模型）：**
-
-| 场景 | v3.0误差 | v3.1误差 | 改进 |
-|------|---------|---------|------|
-| LoRA | 48.5% | 0.01% | **-48.5%** |
-| QLoRA 8-bit | 120.9% | 0.00% | **-120.9%** |
-| QLoRA 4-bit | 220.6% | 0.04% | **-220.6%** |
-
----
 
 ## 注意事项
 
@@ -1012,21 +781,21 @@ activation = effective_params × 2.0 (FP16) × factor × batch_size
 
 **建议：预留20%安全余量**
 
-### 2. MoE模型特殊性【v3.1更新】
+### 2. MoE模型特殊性
 
 MoE模型需要特别注意：
 - 显存按**总参数**计算（所有expert）
 - 算力按**激活参数**估算（激活的expert）
-- **【v3.1修正】激活值按激活参数计算**
+- **激活值按激活参数计算**
 - 路由机制有额外开销（约5-10%）
 - 不同框架实现差异较大
 
-### 3. 并发和batch_size的影响【v3.1更新】
+### 3. 并发和batch_size的影响
 
 - **并发数**主要影响KV Cache（推理）
 - **batch_size**主要影响激活值（训练）
 - 两者都会线性增加显存需求
-- **【v3.1新发现】batch_size还影响激活值因子**
+- **batch_size还影响激活值因子**
 - 建议从小值开始逐步增加
 
 ### 4. 优化技术的取舍
@@ -1055,113 +824,6 @@ MoE模型需要特别注意：
 
 ---
 
-## 更新日志
-
-### v3.1 (2025-01-10) - 重大修正
-
-**🎯 问题修复：**
-- 修正MoE模型激活值计算（应基于激活参数量，不是总参数量）
-- 修正batch_size对激活值因子的影响（batch_size=1时因子更小）
-- 修正QLoRA激活值计算（始终基于FP16精度，不受量化影响）
-
-**📊 改进效果：**
-- 平均误差从6.1%降至0.49%
-- MoE模型LoRA误差从48.5%降至0.01%
-- MoE模型QLoRA 8-bit误差从120.9%降至0.00%
-- MoE模型QLoRA 4-bit误差从220.6%降至0.04%
-- 所有10个测试用例误差<5%
-
-**🔧 技术修改：**
-1. `calculate_full_finetune` - 新增`active_params_b`和`is_moe`参数
-2. `calculate_lora` - 修正激活值计算，支持MoE和batch_size影响
-3. `calculate_qlora` - 修正激活值因子和精度
-
-**📝 文档更新：**
-- 整合所有MD文档到单一README
-- 新增v3.1修正说明章节
-- 新增MoE模型技术深度解析
-- 新增batch_size影响说明
-- 更新所有案例和公式
-
-**✅ 验证数据：**
-- 7B Dense模型（5个场景）：平均误差0.22%
-- 671B MoE模型（4个场景）：平均误差0.16%
-- 总体平均误差：0.49%
-
-### v3.0 (2025-01-XX) - 阿里云PAI公式
-
-**重大更新：**
-- ✅ 基于阿里云PAI官方公式重写
-- ✅ 简化界面，更清晰的单列结果
-- ✅ 整合所有文档到单一README
-- ✅ 验证5项测试，误差<5%
-- ⚠️ MoE模型大batch_size场景存在误差（v3.1已修复）
-
-**验证结果：**
-- 推理FP16: 3.2%
-- 全参微调: 0.7%
-- LoRA: 2.5%
-- QLoRA 8-bit: 2.2%
-- QLoRA 4-bit: 3.2%
-
-**文档优化：**
-- 整合README、QUICK_START、DUAL_MODE等文档
-- 删除冗余文件，保持简洁
-- 添加更多实际案例和GPU选型建议
-
-### v2.0 (2025-01-XX) - 双模式计算
-
-**功能：**
-- 实现理论标准模式和实用优化模式
-- 三列结果展示
-- 基于多个数据点校准
-
-**已知问题：**
-- MoE模型大batch_size计算不准确（v3.1已修复）
-- 双模式增加了复杂度（v3.0简化为单模式）
-
-### v1.0 (2025-01-XX) - 初始版本
-
-**功能：**
-- 单模式显存计算
-- 支持Dense和MoE模型
-- 推理和微调场景
-- Gradio Web界面
-
-**已知问题：**
-- 计算误差较大（v3.0修复）
-
----
-
-## 项目文件
-
-```
-cal_gpu/
-├── gpu_memory_calculator.py       # 主程序 ⭐ (v3.1)
-├── requirements.txt              # 依赖
-├── start.sh / start.bat         # 启动脚本
-├── README.md                    # 本文档 ⭐
-├── test_v31_comprehensive.py    # v3.1综合验证测试
-├── test_verification_batch3.py  # batch_size=3专项测试
-├── test_final_validation.py     # 最终验证脚本
-└── backups/                     # 历史版本备份
-    ├── gpu_memory_calculator_backup.py (v1.0)
-    ├── gpu_memory_calculator_v2_backup.py (v2.0)
-    └── gpu_memory_calculator_v31_20251110.py (v3.1)
-```
-
----
-
-## 贡献与支持
-
-**作者：** Claude Code
-**版本：** v3.1 (2025-01-10)
-**数据来源：** 阿里云PAI官方文档
-**许可证：** 内部使用
-
-**反馈渠道：**
-- 提交Issue：项目问题和建议
-- 参考文档：阿里云PAI官方文档获取最新公式
 
 ---
 
@@ -1203,7 +865,7 @@ AliyunGPUCalculator.calculate_lora(
     is_moe=False
 )
 
-# Mixtral 8×7B MoE模型LoRA微调 【v3.1新增】
+# Mixtral 8×7B MoE模型LoRA微调 
 AliyunGPUCalculator.calculate_lora(
     model_params_b=56.0,     # 总参数：8×7B
     precision_bytes=2.0,
@@ -1226,7 +888,7 @@ AliyunGPUCalculator.calculate_lora(
 | LoRA微调 | 19 GB | RTX 4090 |
 | QLoRA 4-bit | 8 GB | RTX 3070 |
 
-### 激活值因子速查（v3.1）
+### 激活值因子速查
 
 ```python
 # 全参微调
