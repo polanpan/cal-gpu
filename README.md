@@ -1,13 +1,6 @@
 # GPU显存计算器 v3.1
 
 基于阿里云PAI官方公式的GPU显存估算工具
-
-**参考文档：** https://help.aliyun.com/zh/pai/getting-started/estimation-of-the-required-video-memory-for-the-model
-
-**版本：** v3.1 (2025-01-10)
-**平均误差：** 0.49%
-**状态：** ✅ 生产就绪
-
 ---
 
 ## 📋 目录
